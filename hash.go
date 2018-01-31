@@ -39,6 +39,7 @@ var hashedPasswords = make(map[string] string)
 
 // keep track of pending hashing requests so /shutdown request will wait for any outstanding hashing requests
 var pendingHashingTasks = make(map[string] int64)
+var pendingHashingTasksMutex sync.Mutex
 
 // keep running total of time spent on hash requests
 var totalTimeSpent = int64(0)
@@ -72,7 +73,10 @@ func main() {
     if listenAndServeError.Error() == ErrServerClosed.Error() {
         for wait := 0; wait < 10; wait +=1 {
             // if shutdownComplete AND pendingHashingTasks is empty
-            if shutdownComplete && len(pendingHashingTasks) == 0 {
+            pendingHashingTasksMutex.Lock()
+            pendingHashingTasksRemaining := len(pendingHashingTasks)
+            pendingHashingTasksMutex.Unlock()
+            if shutdownComplete && pendingHashingTasksRemaining == 0 {
                 break
             }
 
@@ -114,14 +118,18 @@ func hashPostHandler(w http.ResponseWriter, r *http.Request) {
 
     // per interview requirements, schedule actual password hashing 5 seconds from now
     go func() {
+        pendingHashingTasksMutex.Lock()
         pendingHashingTasks[token] = time.Now().Unix()
+        pendingHashingTasksMutex.Unlock()
         time.Sleep(1000 * 5 * time.Millisecond)
 
         // SHA512 hash the password, then base64
         base64HashedPassword := base64_hash(password)
 
         // remove, hashing task completed
+        pendingHashingTasksMutex.Lock()
         delete(pendingHashingTasks, token)
+        pendingHashingTasksMutex.Unlock()
 
         processEndTime := time.Now()
         duration := processEndTime.Sub(processStartTime)
@@ -159,7 +167,10 @@ func hashGetHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    totalTimeSpentMutex.Lock()
     base64HashedPassword := hashedPasswords[token]
+    totalTimeSpentMutex.Unlock()
+
     if base64HashedPassword == "" { // result not yet available or not found
         http.Error(w, "404 Not Found", 404)
         return
@@ -237,6 +248,11 @@ func passwordFromRequest(body io.ReadCloser) string {
     // must read at least "password="
     numRead, err := io.ReadAtLeast(body, buf, argLen)
     if err != nil && numRead < argLen+minPwLen {
+        return ""
+    }
+
+    // check prefix of buff for "password="
+    if string(buf[0:9]) != "password=" {
         return ""
     }
 
